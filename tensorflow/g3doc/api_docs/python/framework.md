@@ -24,7 +24,7 @@ A default `Graph` is always registered, and accessible by calling
 To add an operation to the default graph, simply call one of the functions
 that defines a new `Operation`:
 
-```
+```python
 c = tf.constant(4.0)
 assert c.graph is tf.get_default_graph()
 ```
@@ -645,8 +645,8 @@ Note that this is unrelated to the
 
 The GraphDef version information of this graph.
 
-For details on the meaning of each version, see [`GraphDef`]
-(https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto).
+For details on the meaning of each version, see
+[`GraphDef`](https://www.tensorflow.org/code/tensorflow/core/framework/graph.proto).
 
 ##### Returns:
 
@@ -745,6 +745,13 @@ with tf.Graph().as_default() as g:
 
 
 #### Other Methods
+- - -
+
+#### `tf.Graph.building_function` {#Graph.building_function}
+
+Returns True iff this graph represents a function.
+
+
 - - -
 
 #### `tf.Graph.colocate_with(op, ignore_existing=False)` {#Graph.colocate_with}
@@ -1403,6 +1410,9 @@ if tf.constant(5) < tf.constant(7):  # Will raise.
   # ...
 ```
 
+This disallows ambiguities between testing the Python value vs testing the
+dynamic condition of the `Tensor`.
+
 ##### Raises:
 
   `TypeError`.
@@ -1505,7 +1515,7 @@ using a tensor as input is not currently allowed
 
 Some useful examples:
 
-```
+```python
 # strip leading and trailing 2 elements
 foo = tf.constant([1,2,3,4,5,6])
 print(foo[2:-2].eval()) # => [3,4]
@@ -2138,6 +2148,7 @@ The following `DType` objects are defined:
 * `tf.qint16`: Quantized 16-bit signed integer.
 * `tf.quint16`: Quantized 16-bit unsigned integer.
 * `tf.qint32`: Quantized 32-bit signed integer.
+* `tf.resource`: Handle to a mutable resource.
 
 In addition, variants of these types with the `_ref` suffix are
 defined for reference-typed tensors.
@@ -2153,7 +2164,7 @@ Returns True if the `other` DType will be converted to this DType.
 
 The conversion rules are as follows:
 
-```
+```python
 DType(T)       .is_compatible_with(DType(T))        == True
 DType(T)       .is_compatible_with(DType(T).as_ref) == True
 DType(T).as_ref.is_compatible_with(DType(T))        == False
@@ -2210,7 +2221,7 @@ Returns a reference `DType` based on this `DType`.
 
 #### `tf.DType.is_floating` {#DType.is_floating}
 
-Returns whether this is a (real) floating point type.
+Returns whether this is a (non-quantized, real) floating point type.
 
 
 - - -
@@ -2261,6 +2272,23 @@ Returns a `numpy.dtype` based on this `DType`.
 #### `tf.DType.as_datatype_enum` {#DType.as_datatype_enum}
 
 Returns a `types_pb2.DataType` enum value based on this `DType`.
+
+
+
+- - -
+
+#### `tf.DType.limits` {#DType.limits}
+
+Return intensity limits, i.e. (min, max) tuple, of the dtype.
+
+##### Args:
+
+  clip_negative : bool, optional
+      If True, clip the negative range (i.e. return 0 for min intensity)
+      even if the image dtype allows negative values.
+Returns
+  min, max : tuple
+    Lower and upper intensity limits.
 
 
 
@@ -2317,6 +2345,13 @@ Returns True iff self != other.
 - - -
 
 #### `tf.DType.__str__()` {#DType.__str__}
+
+
+
+
+- - -
+
+#### `tf.DType.is_numpy_compatible` {#DType.is_numpy_compatible}
 
 
 
@@ -2690,7 +2725,7 @@ Pass "library_filename" to a platform-specific mechanism for dynamically
 loading a library. The rules for determining the exact location of the
 library are platform-specific and are not documented here. When the
 library is loaded, ops and kernels registered in the library via the
-REGISTER_* macros are made available in the TensorFlow process. Note
+`REGISTER_*` macros are made available in the TensorFlow process. Note
 that ops with the same name as an existing op are rejected and not
 registered with the process.
 
@@ -3619,10 +3654,12 @@ Returns the product of `self` and `other`.
 
 Dimensions are summed as follows:
 
+```
   Dimension(m)    * Dimension(n)    == Dimension(m * n)
   Dimension(m)    * Dimension(None) == Dimension(None)
   Dimension(None) * Dimension(n)    == Dimension(None)
   Dimension(None) * Dimension(None) == Dimension(None)
+```
 
 ##### Args:
 
@@ -3723,11 +3760,13 @@ Returns a Dimension that combines the information in `self` and `other`.
 
 Dimensions are combined as follows:
 
+```python
     Dimension(n)   .merge_with(Dimension(n))    == Dimension(n)
     Dimension(n)   .merge_with(Dimension(None)) == Dimension(n)
     Dimension(None).merge_with(Dimension(n))    == Dimension(n)
     Dimension(None).merge_with(Dimension(None)) == Dimension(None)
     Dimension(n)   .merge_with(Dimension(m)) raises ValueError for n != m
+```
 
 ##### Args:
 
@@ -3797,8 +3836,10 @@ Registers a function for converting objects of `base_type` to `Tensor`.
 
 The conversion function must have the following signature:
 
+```python
     def conversion_func(value, dtype=None, name=None, as_ref=False):
       # ...
+```
 
 It must return a `Tensor` with the given `dtype` if specified. If the
 conversion function creates a new `Tensor`, it should use the given

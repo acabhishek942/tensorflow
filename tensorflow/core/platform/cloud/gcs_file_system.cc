@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/lib/gtl/stl_util.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/cloud/google_auth_provider.h"
@@ -51,6 +52,9 @@ constexpr uint64 kUploadRetryDelayMicros = 1000000L;
 // The HTTP response code "308 Resume Incomplete".
 constexpr uint64 HTTP_CODE_RESUME_INCOMPLETE = 308;
 
+// The file statistics returned by Stat() for directories.
+const FileStatistics DIRECTORY_STAT(0, 0, true);
+
 Status GetTmpFilename(string* filename) {
   if (!filename) {
     return errors::Internal("'filename' cannot be nullptr.");
@@ -69,19 +73,30 @@ Status GetTmpFilename(string* filename) {
 ///
 /// For example, "gs://bucket-name/path/to/file.txt" gets split into
 /// "bucket-name" and "path/to/file.txt".
-/// If fname only contains the bucket, the returned object is empty.
-Status ParseGcsPath(StringPiece fname, string* bucket, string* object) {
+/// If fname only contains the bucket and empty_object_ok = true, the returned
+/// object is empty.
+Status ParseGcsPath(StringPiece fname, bool empty_object_ok, string* bucket,
+                    string* object) {
   if (!bucket || !object) {
     return errors::Internal("bucket and object cannot be null.");
   }
   StringPiece scheme, bucketp, objectp;
   ParseURI(fname, &scheme, &bucketp, &objectp);
   if (scheme != "gs") {
-    return errors::InvalidArgument("GCS path must start with gs://");
+    return errors::InvalidArgument("GCS path doesn't start with 'gs://': ",
+                                   fname);
   }
   *bucket = bucketp.ToString();
+  if (bucket->empty() || *bucket == ".") {
+    return errors::InvalidArgument("GCS path doesn't contain a bucket name: ",
+                                   fname);
+  }
   objectp.Consume("/");
   *object = objectp.ToString();
+  if (!empty_object_ok && object->empty()) {
+    return errors::InvalidArgument("GCS path doesn't contain an object name: ",
+                                   fname);
+  }
   return Status::OK();
 }
 
@@ -94,6 +109,13 @@ string MaybeAppendSlash(const string& name) {
     return strings::StrCat(name, "/");
   }
   return name;
+}
+
+// io::JoinPath() doesn't work in cases when we want an empty subpath
+// to result in an appended slash in order for directory markers
+// to be processed correctly: "gs://a/b" + "" should give "gs://a/b/".
+string JoinGcsPath(const string& path, const string& subpath) {
+  return strings::StrCat(MaybeAppendSlash(path), subpath);
 }
 
 Status ParseJson(StringPiece json, Json::Value* result) {
@@ -109,8 +131,8 @@ Status GetValue(const Json::Value& parent, const string& name,
                 Json::Value* result) {
   *result = parent.get(name, Json::Value::null);
   if (*result == Json::Value::null) {
-    return errors::Internal(strings::StrCat(
-        "The field '", name, "' was expected in the JSON response."));
+    return errors::Internal("The field '", name,
+                            "' was expected in the JSON response.");
   }
   return Status::OK();
 }
@@ -122,8 +144,8 @@ Status GetStringValue(const Json::Value& parent, const string& name,
   TF_RETURN_IF_ERROR(GetValue(parent, name, &result_value));
   if (!result_value.isString()) {
     return errors::Internal(
-        strings::StrCat("The field '", name,
-                        "' in the JSON response was expected to be a string."));
+        "The field '", name,
+        "' in the JSON response was expected to be a string.");
   }
   *result = result_value.asString();
   return Status::OK();
@@ -143,8 +165,8 @@ Status GetInt64Value(const Json::Value& parent, const string& name,
     return Status::OK();
   }
   return errors::Internal(
-      strings::StrCat("The field '", name,
-                      "' in the JSON response was expected to be a number."));
+      "The field '", name,
+      "' in the JSON response was expected to be a number.");
 }
 
 /// Reads a boolean JSON value with the given name from a parent JSON value.
@@ -153,9 +175,9 @@ Status GetBoolValue(const Json::Value& parent, const string& name,
   Json::Value result_value;
   TF_RETURN_IF_ERROR(GetValue(parent, name, &result_value));
   if (!result_value.isBool()) {
-    return errors::Internal(strings::StrCat(
+    return errors::Internal(
         "The field '", name,
-        "' in the JSON response was expected to be a boolean."));
+        "' in the JSON response was expected to be a boolean.");
   }
   *result = result_value.asBool();
   return Status::OK();
@@ -214,9 +236,9 @@ class GcsRandomAccessFile : public RandomAccessFile {
     if (result->size() < n) {
       // This is not an error per se. The RandomAccessFile interface expects
       // that Read returns OutOfRange if fewer bytes were read than requested.
-      return errors::OutOfRange(strings::StrCat("EOF reached, ", result->size(),
-                                                " bytes were read out of ", n,
-                                                " bytes requested."));
+      return errors::OutOfRange("EOF reached, ", result->size(),
+                                " bytes were read out of ", n,
+                                " bytes requested.");
     }
     return Status::OK();
   }
@@ -359,8 +381,8 @@ class GcsWritableFile : public WritableFile {
         case errors::Code::NOT_FOUND:
           // GCS docs recommend retrying the whole upload. We're relying on the
           // RetryingFileSystem to retry the Sync() call.
-          return errors::Unavailable(
-              strings::StrCat("Could not upload gs://", bucket_, "/", object_));
+          return errors::Unavailable("Could not upload gs://", bucket_, "/",
+                                     object_);
         case errors::Code::UNAVAILABLE:
           // The upload can be resumed, but GCS docs recommend an exponential
           // back-off.
@@ -372,8 +394,7 @@ class GcsWritableFile : public WritableFile {
           return upload_status;
       }
     }
-    return errors::Aborted(
-        strings::StrCat("Upload gs://", bucket_, "/", object_, " failed."));
+    return errors::Aborted("Upload gs://", bucket_, "/", object_, " failed.");
   }
 
  private:
@@ -426,9 +447,9 @@ class GcsWritableFile : public WritableFile {
         request->Send(), " when initiating an upload to ", GetGcsPath());
     *session_uri = request->GetResponseHeader("Location");
     if (session_uri->empty()) {
-      return errors::Internal(
-          strings::StrCat("Unexpected response from GCS when writing to ",
-                          GetGcsPath(), ": 'Location' header not returned."));
+      return errors::Internal("Unexpected response from GCS when writing to ",
+                              GetGcsPath(),
+                              ": 'Location' header not returned.");
     }
     return Status::OK();
   }
@@ -471,18 +492,19 @@ class GcsWritableFile : public WritableFile {
       // This means GCS doesn't have any bytes of the file yet.
       *uploaded = 0;
     } else {
-      std::vector<int32> range_parts;
-      if (!str_util::SplitAndParseAsInts(received_range, '-', &range_parts) ||
+      StringPiece range_piece(received_range);
+      range_piece.Consume("bytes=");  // May or may not be present.
+      std::vector<int64> range_parts;
+      if (!str_util::SplitAndParseAsInts(range_piece, '-', &range_parts) ||
           range_parts.size() != 2) {
-        return errors::Internal(strings::StrCat(
-            "Unexpected response from GCS when writing ", GetGcsPath(),
-            ": Range header '", received_range, "' could not be parsed."));
+        return errors::Internal("Unexpected response from GCS when writing ",
+                                GetGcsPath(), ": Range header '",
+                                received_range, "' could not be parsed.");
       }
       if (range_parts[0] != 0) {
-        return errors::Internal(
-            strings::StrCat("Unexpected response from GCS when writing to ",
-                            GetGcsPath(), ": the returned range '",
-                            received_range, "' does not start at zero."));
+        return errors::Internal("Unexpected response from GCS when writing to ",
+                                GetGcsPath(), ": the returned range '",
+                                received_range, "' does not start at zero.");
       }
       // If GCS returned "Range: 0-10", this means 11 bytes were uploaded.
       *uploaded = range_parts[1] + 1;
@@ -555,7 +577,7 @@ GcsFileSystem::GcsFileSystem(
 Status GcsFileSystem::NewRandomAccessFile(
     const string& fname, std::unique_ptr<RandomAccessFile>* result) {
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, false, &bucket, &object));
   result->reset(new GcsRandomAccessFile(bucket, object, auth_provider_.get(),
                                         http_request_factory_.get(),
                                         read_ahead_bytes_));
@@ -565,7 +587,7 @@ Status GcsFileSystem::NewRandomAccessFile(
 Status GcsFileSystem::NewWritableFile(const string& fname,
                                       std::unique_ptr<WritableFile>* result) {
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, false, &bucket, &object));
   result->reset(new GcsWritableFile(bucket, object, auth_provider_.get(),
                                     http_request_factory_.get(),
                                     max_upload_attempts_));
@@ -604,7 +626,7 @@ Status GcsFileSystem::NewAppendableFile(const string& fname,
 
   // Create a writable file and pass the old content to it.
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, false, &bucket, &object));
   result->reset(new GcsWritableFile(
       bucket, object, auth_provider_.get(), old_content_filename,
       http_request_factory_.get(), max_upload_attempts_));
@@ -629,19 +651,36 @@ Status GcsFileSystem::NewReadOnlyMemoryRegionFromFile(
 
 bool GcsFileSystem::FileExists(const string& fname) {
   string bucket, object;
-  if (!ParseGcsPath(fname, &bucket, &object).ok()) {
+  if (!ParseGcsPath(fname, true, &bucket, &object).ok()) {
     LOG(ERROR) << "Could not parse GCS file name " << fname;
     return false;
   }
   if (object.empty()) {
-    return BucketExists(bucket).ok();
+    bool result;
+    return BucketExists(bucket, &result).ok() && result;
   }
-  return ObjectExists(bucket, object).ok() || FolderExists(fname).ok();
+  bool result;
+  return (ObjectExists(bucket, object, &result).ok() && result) ||
+         (FolderExists(fname, &result).ok() && result);
 }
 
-Status GcsFileSystem::ObjectExists(const string& bucket, const string& object) {
-  FileStatistics stat;
-  return StatForObject(bucket, object, &stat);
+Status GcsFileSystem::ObjectExists(const string& bucket, const string& object,
+                                   bool* result) {
+  if (!result) {
+    return errors::Internal("'result' cannot be nullptr.");
+  }
+  FileStatistics not_used_stat;
+  const Status status = StatForObject(bucket, object, &not_used_stat);
+  switch (status.code()) {
+    case errors::Code::OK:
+      *result = true;
+      return Status::OK();
+    case errors::Code::NOT_FOUND:
+      *result = false;
+      return Status::OK();
+    default:
+      return status;
+  }
 }
 
 Status GcsFileSystem::StatForObject(const string& bucket, const string& object,
@@ -686,7 +725,10 @@ Status GcsFileSystem::StatForObject(const string& bucket, const string& object,
   return Status::OK();
 }
 
-Status GcsFileSystem::BucketExists(const string& bucket) {
+Status GcsFileSystem::BucketExists(const string& bucket, bool* result) {
+  if (!result) {
+    return errors::Internal("'result' cannot be nullptr.");
+  }
   string auth_token;
   TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
 
@@ -694,32 +736,68 @@ Status GcsFileSystem::BucketExists(const string& bucket) {
   TF_RETURN_IF_ERROR(request->Init());
   request->SetUri(strings::StrCat(kGcsUriBase, "b/", bucket));
   request->AddAuthBearerHeader(auth_token);
-  return request->Send();
+  const Status status = request->Send();
+  switch (status.code()) {
+    case errors::Code::OK:
+      *result = true;
+      return Status::OK();
+    case errors::Code::NOT_FOUND:
+      *result = false;
+      return Status::OK();
+    default:
+      return status;
+  }
 }
 
-Status GcsFileSystem::FolderExists(const string& dirname) {
-  std::vector<string> children;
-  TF_RETURN_IF_ERROR(GetChildrenBounded(dirname, 1, &children));
-  if (children.empty()) {
-    return errors::NotFound("Folder does not exist.");
+Status GcsFileSystem::FolderExists(const string& dirname, bool* result) {
+  if (!result) {
+    return errors::Internal("'result' cannot be nullptr.");
   }
+  std::vector<string> children;
+  TF_RETURN_IF_ERROR(GetChildrenBounded(dirname, 1, &children, true));
+  *result = !children.empty();
   return Status::OK();
 }
 
 Status GcsFileSystem::GetChildren(const string& dirname,
                                   std::vector<string>* result) {
-  return GetChildrenBounded(dirname, UINT64_MAX, result);
+  return GetChildrenBounded(dirname, UINT64_MAX, result, false);
+}
+
+Status GcsFileSystem::GetMatchingPaths(const string& pattern,
+                                       std::vector<string>* results) {
+  results->clear();
+  // Find the fixed prefix by looking for the first wildcard.
+  const string& fixed_prefix =
+      pattern.substr(0, pattern.find_first_of("*?[\\"));
+  const string& dir = io::Dirname(fixed_prefix).ToString();
+  if (dir.empty()) {
+    return errors::InvalidArgument("A GCS pattern doesn't have a bucket name: ",
+                                   pattern);
+  }
+  std::vector<string> all_files;
+  TF_RETURN_IF_ERROR(GetChildrenBounded(dir, UINT64_MAX, &all_files, true));
+
+  // Match all obtained files to the input pattern.
+  for (const auto& f : all_files) {
+    const string& full_path = io::JoinPath(dir, f);
+    if (Env::Default()->MatchPath(full_path, pattern)) {
+      results->push_back(full_path);
+    }
+  }
+  return Status::OK();
 }
 
 Status GcsFileSystem::GetChildrenBounded(const string& dirname,
                                          uint64 max_results,
-                                         std::vector<string>* result) {
+                                         std::vector<string>* result,
+                                         bool recursive) {
   if (!result) {
     return errors::InvalidArgument("'result' cannot be null");
   }
   string bucket, object_prefix;
   TF_RETURN_IF_ERROR(
-      ParseGcsPath(MaybeAppendSlash(dirname), &bucket, &object_prefix));
+      ParseGcsPath(MaybeAppendSlash(dirname), true, &bucket, &object_prefix));
 
   string nextPageToken;
   uint64 retrieved_results = 0;
@@ -732,8 +810,16 @@ Status GcsFileSystem::GetChildrenBounded(const string& dirname,
     StringPiece response_piece;
     std::unique_ptr<HttpRequest> request(http_request_factory_->Create());
     TF_RETURN_IF_ERROR(request->Init());
-    auto uri = strings::StrCat(kGcsUriBase, "b/", bucket,
-                               "/o?fields=items%2Fname%2CnextPageToken");
+    auto uri = strings::StrCat(kGcsUriBase, "b/", bucket, "/o");
+    if (recursive) {
+      uri = strings::StrCat(uri, "?fields=items%2Fname%2CnextPageToken");
+    } else {
+      // Set "/" as a delimiter to ask GCS to treat subfolders as children
+      // and return them in "prefixes".
+      uri = strings::StrCat(uri,
+                            "?fields=items%2Fname%2Cprefixes%2CnextPageToken");
+      uri = strings::StrCat(uri, "&delimiter=%2F");
+    }
     if (!object_prefix.empty()) {
       uri = strings::StrCat(uri, "&prefix=",
                             request->EscapeString(object_prefix));
@@ -783,6 +869,33 @@ Status GcsFileSystem::GetChildrenBounded(const string& dirname,
         return Status::OK();
       }
     }
+    const auto prefixes = root.get("prefixes", Json::Value::null);
+    if (prefixes != Json::Value::null) {
+      // Subfolders are returned for the non-recursive mode.
+      if (!prefixes.isArray()) {
+        return errors::Internal(
+            "'prefixes' was expected to be an array in the GCS response.");
+      }
+      for (size_t i = 0; i < prefixes.size(); i++) {
+        const auto prefix = prefixes.get(i, Json::Value::null);
+        if (prefix == Json::Value::null || !prefix.isString()) {
+          return errors::Internal(
+              "'prefixes' was expected to be an array of strings in the GCS "
+              "response.");
+        }
+        const string& prefix_str = prefix.asString();
+        StringPiece relative_path(prefix_str);
+        if (!relative_path.Consume(object_prefix)) {
+          return errors::Internal(
+              "Unexpected response: the returned folder name ", prefix_str,
+              " doesn't match the prefix ", object_prefix);
+        }
+        result->emplace_back(relative_path.ToString());
+        if (++retrieved_results >= max_results) {
+          return Status::OK();
+        }
+      }
+    }
     const auto token = root.get("nextPageToken", Json::Value::null);
     if (token == Json::Value::null) {
       return Status::OK();
@@ -800,24 +913,36 @@ Status GcsFileSystem::Stat(const string& fname, FileStatistics* stat) {
     return errors::Internal("'stat' cannot be nullptr.");
   }
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
-  if (StatForObject(bucket, object, stat).ok()) {
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, true, &bucket, &object));
+  if (object.empty()) {
+    bool is_bucket;
+    TF_RETURN_IF_ERROR(BucketExists(bucket, &is_bucket));
+    if (is_bucket) {
+      *stat = DIRECTORY_STAT;
+      return Status::OK();
+    }
+    return errors::NotFound("The specified bucket ", fname, " was not found.");
+  }
+
+  const Status status = StatForObject(bucket, object, stat);
+  if (status.ok()) {
     return Status::OK();
   }
-  if ((object.empty() && BucketExists(bucket).ok()) ||
-      (!object.empty() && FolderExists(fname).ok())) {
-    stat->length = 0;
-    stat->mtime_nsec = 0;
-    stat->is_directory = true;
+  if (status.code() != errors::Code::NOT_FOUND) {
+    return status;
+  }
+  bool is_folder;
+  TF_RETURN_IF_ERROR(FolderExists(fname, &is_folder));
+  if (is_folder) {
+    *stat = DIRECTORY_STAT;
     return Status::OK();
   }
-  return errors::NotFound(
-      strings::StrCat("The specified path ", fname, " was not found."));
+  return errors::NotFound("The specified path ", fname, " was not found.");
 }
 
 Status GcsFileSystem::DeleteFile(const string& fname) {
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, false, &bucket, &object));
 
   string auth_token;
   TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
@@ -834,13 +959,13 @@ Status GcsFileSystem::DeleteFile(const string& fname) {
 
 Status GcsFileSystem::CreateDir(const string& dirname) {
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(dirname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(dirname, true, &bucket, &object));
   if (object.empty()) {
-    if (BucketExists(bucket).ok()) {
-      return Status::OK();
-    }
-    return errors::NotFound(
-        strings::StrCat("The specified bucket ", dirname, " was not found."));
+    bool is_bucket;
+    TF_RETURN_IF_ERROR(BucketExists(bucket, &is_bucket));
+    return is_bucket ? Status::OK()
+                     : errors::NotFound("The specified bucket ", dirname,
+                                        " was not found.");
   }
   // Create a zero-length directory marker object.
   std::unique_ptr<WritableFile> file;
@@ -857,7 +982,7 @@ Status GcsFileSystem::DeleteDir(const string& dirname) {
   // with the corresponding name prefix or if there is exactly one matching
   // object and it is the directory marker. Therefore we need to retrieve
   // at most two children for the prefix to detect if a directory is empty.
-  TF_RETURN_IF_ERROR(GetChildrenBounded(dirname, 2, &children));
+  TF_RETURN_IF_ERROR(GetChildrenBounded(dirname, 2, &children, true));
 
   if (children.size() > 1 || (children.size() == 1 && !children[0].empty())) {
     return errors::FailedPrecondition("Cannot delete a non-empty directory.");
@@ -873,6 +998,11 @@ Status GcsFileSystem::GetFileSize(const string& fname, uint64* file_size) {
   if (!file_size) {
     return errors::Internal("'file_size' cannot be nullptr.");
   }
+
+  // Only validate the name.
+  string bucket, object;
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, false, &bucket, &object));
+
   FileStatistics stat;
   TF_RETURN_IF_ERROR(Stat(fname, &stat));
   *file_size = stat.length;
@@ -885,14 +1015,10 @@ Status GcsFileSystem::RenameFile(const string& src, const string& target) {
   }
   // Rename all individual objects in the directory one by one.
   std::vector<string> children;
-  TF_RETURN_IF_ERROR(GetChildren(src, &children));
+  TF_RETURN_IF_ERROR(GetChildrenBounded(src, UINT64_MAX, &children, true));
   for (const string& subpath : children) {
-    // io::JoinPath() wouldn't work here, because we want an empty subpath
-    // to result in an appended slash in order for directory markers
-    // to be processed correctly: "gs://a/b" + "" should give "gs:/a/b/".
     TF_RETURN_IF_ERROR(
-        RenameObject(strings::StrCat(MaybeAppendSlash(src), subpath),
-                     strings::StrCat(MaybeAppendSlash(target), subpath)));
+        RenameObject(JoinGcsPath(src, subpath), JoinGcsPath(target, subpath)));
   }
   return Status::OK();
 }
@@ -900,8 +1026,9 @@ Status GcsFileSystem::RenameFile(const string& src, const string& target) {
 // Uses a GCS API command to copy the object and then deletes the old one.
 Status GcsFileSystem::RenameObject(const string& src, const string& target) {
   string src_bucket, src_object, target_bucket, target_object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(src, &src_bucket, &src_object));
-  TF_RETURN_IF_ERROR(ParseGcsPath(target, &target_bucket, &target_object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(src, false, &src_bucket, &src_object));
+  TF_RETURN_IF_ERROR(
+      ParseGcsPath(target, false, &target_bucket, &target_object));
 
   string auth_token;
   TF_RETURN_IF_ERROR(AuthProvider::GetToken(auth_provider_.get(), &auth_token));
@@ -931,9 +1058,9 @@ Status GcsFileSystem::RenameObject(const string& src, const string& target) {
     // which requires multiple rewrite calls.
     // TODO(surkov): implement multi-step rewrites.
     return errors::Unimplemented(
-        strings::StrCat("Couldn't rename ", src, " to ", target,
-                        ": moving large files between buckets with different "
-                        "locations or storage classes is not supported."));
+        "Couldn't rename ", src, " to ", target,
+        ": moving large files between buckets with different "
+        "locations or storage classes is not supported.");
   }
 
   TF_RETURN_IF_ERROR(DeleteFile(src));
@@ -942,23 +1069,62 @@ Status GcsFileSystem::RenameObject(const string& src, const string& target) {
 
 Status GcsFileSystem::IsDirectory(const string& fname) {
   string bucket, object;
-  TF_RETURN_IF_ERROR(ParseGcsPath(fname, &bucket, &object));
+  TF_RETURN_IF_ERROR(ParseGcsPath(fname, true, &bucket, &object));
   if (object.empty()) {
-    if (BucketExists(bucket).ok()) {
+    bool is_bucket;
+    TF_RETURN_IF_ERROR(BucketExists(bucket, &is_bucket));
+    if (is_bucket) {
       return Status::OK();
     }
-    return errors::NotFound(strings::StrCat("The specified bucket gs://",
-                                            bucket, " was not found."));
+    return errors::NotFound("The specified bucket gs://", bucket,
+                            " was not found.");
   }
-  if (FolderExists(fname).ok()) {
+  bool is_folder;
+  TF_RETURN_IF_ERROR(FolderExists(fname, &is_folder));
+  if (is_folder) {
     return Status::OK();
   }
-  if (ObjectExists(bucket, object).ok()) {
-    return errors::FailedPrecondition(
-        strings::StrCat("The specified path ", fname, " is not a directory."));
+  bool is_object;
+  TF_RETURN_IF_ERROR(ObjectExists(bucket, object, &is_object));
+  if (is_object) {
+    return errors::FailedPrecondition("The specified path ", fname,
+                                      " is not a directory.");
   }
-  return errors::NotFound(
-      strings::StrCat("The specified path ", fname, " was not found."));
+  return errors::NotFound("The specified path ", fname, " was not found.");
+}
+
+Status GcsFileSystem::DeleteRecursively(const string& dirname,
+                                        int64* undeleted_files,
+                                        int64* undeleted_dirs) {
+  if (!undeleted_files || !undeleted_dirs) {
+    return errors::Internal(
+        "'undeleted_files' and 'undeleted_dirs' cannot be nullptr.");
+  }
+  *undeleted_files = 0;
+  *undeleted_dirs = 0;
+  if (!IsDirectory(dirname).ok()) {
+    *undeleted_dirs = 1;
+    return Status(
+        error::NOT_FOUND,
+        strings::StrCat(dirname, " doesn't exist or not a directory."));
+  }
+  std::vector<string> all_objects;
+  // Get all children in the directory recursively.
+  TF_RETURN_IF_ERROR(GetChildrenBounded(dirname, UINT64_MAX, &all_objects,
+                                        true /* recursive */));
+  for (const string& object : all_objects) {
+    const string& full_path = JoinGcsPath(dirname, object);
+    // Delete all objects including directory markers for subfolders.
+    if (!DeleteFile(full_path).ok()) {
+      if (IsDirectory(full_path).ok()) {
+        // The object is a directory marker.
+        (*undeleted_dirs)++;
+      } else {
+        (*undeleted_files)++;
+      }
+    }
+  }
+  return Status::OK();
 }
 
 REGISTER_FILE_SYSTEM("gs", RetryingGcsFileSystem);

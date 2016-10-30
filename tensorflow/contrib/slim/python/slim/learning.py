@@ -389,10 +389,11 @@ def create_train_op(
     optimizer: A tf.Optimizer to use for computing the gradients.
     global_step: A `Tensor` representing the global step variable. If left as
       `None`, then slim.variables.global_step() is used.
-    update_ops: an optional list of updates to execute. Note that the update_ops
-      that are used are the union of those update_ops passed to the function and
-      the value of slim.ops.GetUpdateOps(). Therefore, if `update_ops` is None,
-      then the value of slim.ops.GetUpdateOps() is still used.
+    update_ops: An optional list of updates to execute. If `update_ops` is
+      `None`, then the update ops are set to the contents of the
+      `tf.GraphKeys.UPDATE_OPS` collection. If `update_ops` is not `None`, but
+      it doesn't contain all of the update ops in `tf.GraphKeys.UPDATE_OPS`,
+      a warning will be displayed.
     variables_to_train: an optional list of variables to train. If None, it will
       default to all tf.trainable_variables().
     clip_gradient_norm: If greater than 0 then the gradients would be clipped
@@ -470,7 +471,14 @@ def create_train_op(
                                           'LossTensor is inf or nan')
 
     # Ensure the train_tensor computes grad_updates.
-    return control_flow_ops.with_dependencies([grad_updates], total_loss)
+    train_op = control_flow_ops.with_dependencies([grad_updates], total_loss)
+
+  # Add the operation used for training to the 'train_op' collection
+  train_ops = ops.get_collection_ref(ops.GraphKeys.TRAIN_OP)
+  if train_op not in train_ops:
+    train_ops.append(train_op)
+
+  return train_op
 
 
 def _wait_for_step(sess, global_step, step):
@@ -699,16 +707,20 @@ def train(train_op,
 
     if is_chief and sync_optimizer is not None:
       if not isinstance(sync_optimizer,
-                        sync_replicas_optimizer.SyncReplicasOptimizer):
+                        (sync_replicas_optimizer.SyncReplicasOptimizer,
+                         sync_replicas_optimizer.SyncReplicasOptimizerV2)):
         raise ValueError(
-            '`sync_optimizer` must be a tf.train.SyncReplicasOptimizer')
+            '`sync_optimizer` must be a tf.train.SyncReplicasOptimizer or '
+            'tf.train.SyncReplicasOptimizerV2.')
 
       # Need to create these BEFORE the supervisor finalizes the graph:
       with ops.control_dependencies([init_op]):
         init_tokens_op = sync_optimizer.get_init_tokens_op()
       init_op = init_tokens_op
       chief_queue_runner = sync_optimizer.get_chief_queue_runner()
-      cleanup_op = sync_optimizer.get_clean_up_op()
+      if isinstance(sync_optimizer,
+                    sync_replicas_optimizer.SyncReplicasOptimizer):
+        cleanup_op = sync_optimizer.get_clean_up_op()
 
     if train_step_kwargs == _USE_DEFAULT:
       with ops.name_scope('train_step'):

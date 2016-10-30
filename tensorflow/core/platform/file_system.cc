@@ -14,17 +14,27 @@ limitations under the License.
 ==============================================================================*/
 
 #include <sys/stat.h>
+#include <deque>
 
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
 #include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/strings/scanner.h"
 #include "tensorflow/core/lib/strings/str_util.h"
+#include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/file_system.h"
 #include "tensorflow/core/platform/protobuf.h"
 
 namespace tensorflow {
+
+namespace {
+
+constexpr int32 kNumThreads = 8;
+
+}  // anonymous namespace
 
 FileSystem::~FileSystem() {}
 
@@ -79,6 +89,156 @@ void ParseURI(StringPiece remaining, StringPiece* scheme, StringPiece* host,
 
   // 2. The rest is the path
   *path = remaining;
+}
+
+string CreateURI(StringPiece scheme, StringPiece host, StringPiece path) {
+  if (scheme.empty()) {
+    return path.ToString();
+  }
+  return strings::StrCat(scheme, "://", host, path);
+}
+
+Status FileSystem::GetMatchingPaths(const string& pattern,
+                                    std::vector<string>* results) {
+  results->clear();
+  // Find the fixed prefix by looking for the first wildcard.
+  const string& fixed_prefix =
+      pattern.substr(0, pattern.find_first_of("*?[\\"));
+  std::vector<string> all_files;
+  string dir = io::Dirname(fixed_prefix).ToString();
+  if (dir.empty()) dir = ".";
+
+  // Setup a BFS to explore everything under dir.
+  std::deque<string> dir_q;
+  dir_q.push_back(dir);
+  Status ret;  // Status to return.
+  std::vector<bool> children_dir_status;  // holds is_dir status for children.
+  while (!dir_q.empty()) {
+    string current_dir = dir_q.front();
+    dir_q.pop_front();
+    std::vector<string> children;
+    Status s = GetChildren(current_dir, &children);
+    ret.Update(s);
+    if (children.empty()) continue;
+    // This IsDirectory call can be expensive for some FS. Parallelizing it.
+    thread::ThreadPool* children_threads =
+        new thread::ThreadPool(Env::Default(), "TraverseChildren", kNumThreads);
+    children_dir_status.resize(children.size());
+    for (int i = 0; i < children.size(); ++i) {
+      const string child_path = io::JoinPath(current_dir, children[i]);
+      children_threads->Schedule([this, child_path, i, &children_dir_status] {
+        children_dir_status[i] = this->IsDirectory(child_path).ok();
+      });
+    }
+    delete children_threads;
+    for (int i = 0; i < children.size(); ++i) {
+      const string child_path = io::JoinPath(current_dir, children[i]);
+      // In case the child_path doesn't start with the fixed_prefix then we bail
+      // and don't add it to the queue / candidates.
+      if (!StringPiece(child_path).starts_with(fixed_prefix)) continue;
+      // If the child is a directory add it to the queue.
+      if (children_dir_status[i]) {
+        dir_q.push_back(child_path);
+      }
+      all_files.push_back(child_path);
+    }
+  }
+
+  // Match all obtained files to the input pattern.
+  for (const auto& f : all_files) {
+    if (Env::Default()->MatchPath(f, pattern)) {
+      results->push_back(f);
+    }
+  }
+  return ret;
+}
+
+Status FileSystem::DeleteRecursively(const string& dirname,
+                                     int64* undeleted_files,
+                                     int64* undeleted_dirs) {
+  CHECK_NOTNULL(undeleted_files);
+  CHECK_NOTNULL(undeleted_dirs);
+
+  *undeleted_files = 0;
+  *undeleted_dirs = 0;
+  // Make sure that dirname exists;
+  if (!FileExists(dirname)) {
+    (*undeleted_dirs)++;
+    return Status(error::NOT_FOUND, "Directory doesn't exist");
+  }
+  std::deque<string> dir_q;      // Queue for the BFS
+  std::vector<string> dir_list;  // List of all dirs discovered
+  dir_q.push_back(dirname);
+  Status ret;  // Status to be returned.
+  // Do a BFS on the directory to discover all the sub-directories. Remove all
+  // children that are files along the way. Then cleanup and remove the
+  // directories in reverse order.;
+  while (!dir_q.empty()) {
+    string dir = dir_q.front();
+    dir_q.pop_front();
+    dir_list.push_back(dir);
+    std::vector<string> children;
+    // GetChildren might fail if we don't have appropriate permissions.
+    Status s = GetChildren(dir, &children);
+    ret.Update(s);
+    if (!s.ok()) {
+      (*undeleted_dirs)++;
+      continue;
+    }
+    for (const string& child : children) {
+      const string child_path = io::JoinPath(dir, child);
+      // If the child is a directory add it to the queue, otherwise delete it.
+      if (IsDirectory(child_path).ok()) {
+        dir_q.push_back(child_path);
+      } else {
+        // Delete file might fail because of permissions issues or might be
+        // unimplemented.
+        Status del_status = DeleteFile(child_path);
+        ret.Update(del_status);
+        if (!del_status.ok()) {
+          (*undeleted_files)++;
+        }
+      }
+    }
+  }
+  // Now reverse the list of directories and delete them. The BFS ensures that
+  // we can delete the directories in this order.
+  std::reverse(dir_list.begin(), dir_list.end());
+  for (const string& dir : dir_list) {
+    // Delete dir might fail because of permissions issues or might be
+    // unimplemented.
+    Status s = DeleteDir(dir);
+    ret.Update(s);
+    if (!s.ok()) {
+      (*undeleted_dirs)++;
+    }
+  }
+  return ret;
+}
+
+Status FileSystem::RecursivelyCreateDir(const string& dirname) {
+  StringPiece scheme, host, remaining_dir;
+  ParseURI(dirname, &scheme, &host, &remaining_dir);
+  std::vector<StringPiece> sub_dirs;
+  while (!FileExists(CreateURI(scheme, host, remaining_dir)) &&
+         !remaining_dir.empty()) {
+    // Basename returns "" for / ending dirs.
+    if (!remaining_dir.ends_with("/")) {
+      sub_dirs.push_back(io::Basename(remaining_dir));
+    }
+    remaining_dir = io::Dirname(remaining_dir);
+  }
+
+  // sub_dirs contains all the dirs to be created but in reverse order.
+  std::reverse(sub_dirs.begin(), sub_dirs.end());
+
+  // Now create the directories.
+  string built_path = remaining_dir.ToString();
+  for (const StringPiece sub_dir : sub_dirs) {
+    built_path = io::JoinPath(built_path, sub_dir);
+    TF_RETURN_IF_ERROR(CreateDir(CreateURI(scheme, host, built_path)));
+  }
+  return Status::OK();
 }
 
 }  // namespace tensorflow

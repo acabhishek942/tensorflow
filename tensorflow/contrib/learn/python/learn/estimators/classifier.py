@@ -20,6 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 from tensorflow.contrib import metrics as metrics_lib
+from tensorflow.contrib.framework import deprecated
 from tensorflow.contrib.framework import deprecated_arg_values
 from tensorflow.contrib.learn.python.learn.estimators import estimator
 from tensorflow.contrib.session_bundle import exporter
@@ -27,6 +28,8 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn
 
 
+@deprecated('2016-11-30', 'Please write an appropriate function for use with'
+            ' your estimator.')
 def classification_signature_fn(examples, unused_features, predictions):
   """Creates classification signature from given examples and predictions.
 
@@ -61,8 +64,9 @@ class Classifier(estimator.Estimator):
   CLASS_OUTPUT = 'classes'
   PROBABILITY_OUTPUT = 'probabilities'
 
+  @deprecated('2016-11-30', 'Please use Estimator directly.')
   def __init__(self, model_fn, n_classes, model_dir=None, config=None,
-               params=None):
+               params=None, feature_engineering_fn=None):
     """Constructor for Classifier.
 
     Args:
@@ -73,6 +77,10 @@ class Classifier(estimator.Estimator):
         continue training a previously saved model.
       config: Configuration object (optional)
       params: `dict` of hyper parameters that will be passed into `model_fn`.
+      feature_engineering_fn: Feature engineering function. Takes features and
+                        targets which are the output of `input_fn` and
+                        returns features and targets which will be fed
+                        into the model.
     """
     self._n_classes = n_classes
     self._logits_fn = model_fn
@@ -80,9 +88,9 @@ class Classifier(estimator.Estimator):
       model_fn = self._classifier_model_with_params
     else:
       model_fn = self._classifier_model
-    super(Classifier, self).__init__(model_fn=model_fn,
-                                     model_dir=model_dir, config=config,
-                                     params=params)
+    super(Classifier, self).__init__(
+        model_fn=model_fn, model_dir=model_dir, config=config, params=params,
+        feature_engineering_fn=feature_engineering_fn)
 
   def evaluate(self,
                x=None,
@@ -122,7 +130,7 @@ class Classifier(estimator.Estimator):
   @deprecated_arg_values(
       estimator.AS_ITERABLE_DATE, estimator.AS_ITERABLE_INSTRUCTIONS,
       as_iterable=False)
-  def predict(self, x=None, input_fn=None, batch_size=None, as_iterable=False):
+  def predict(self, x=None, input_fn=None, batch_size=None, as_iterable=True):
     """Returns predicted classes for given features.
 
     Args:
@@ -156,7 +164,7 @@ class Classifier(estimator.Estimator):
       estimator.AS_ITERABLE_DATE, estimator.AS_ITERABLE_INSTRUCTIONS,
       as_iterable=False)
   def predict_proba(
-      self, x=None, input_fn=None, batch_size=None, as_iterable=False):
+      self, x=None, input_fn=None, batch_size=None, as_iterable=True):
     """Returns predicted probabilty distributions for given features.
 
     Args:

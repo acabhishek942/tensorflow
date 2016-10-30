@@ -142,33 +142,13 @@ class Env {
   Status GetChildren(const string& dir, std::vector<string>* result);
 
   /// \brief Returns true if the path matches the given pattern. The wildcards
-  /// allowed in pattern are described below (GetMatchingPaths).
+  /// allowed in pattern are described in FileSystem::GetMatchingPaths.
   virtual bool MatchPath(const string& path, const string& pattern) = 0;
 
   /// \brief Given a pattern, stores in *results the set of paths that matches
   /// that pattern. *results is cleared.
   ///
-  /// pattern must match all of a name, not just a substring.
-  //
-  /// pattern: { term }
-  /// term:
-  ///   '*': matches any sequence of non-'/' characters
-  ///   '?': matches a single non-'/' character
-  ///   '[' [ '^' ] { match-list } ']':
-  ///        matches any single character (not) on the list
-  ///   c: matches character c (c != '*', '?', '\\', '[')
-  ///   '\\' c: matches character c
-  /// character-range:
-  ///   c: matches character c (c != '\\', '-', ']')
-  ///   '\\' c: matches character c
-  ///   lo '-' hi: matches character c for lo <= c <= hi
-  ///
-  /// Typical return codes
-  ///  * OK - no errors
-  ///  * UNIMPLEMENTED - Some underlying functions (like GetChildren) are not
-  ///                    implemented
-  /// The default implementation uses a combination of GetChildren, MatchPath
-  /// and IsDirectory.
+  /// More details about `pattern` in FileSystem::GetMatchingPaths.
   virtual Status GetMatchingPaths(const string& pattern,
                                   std::vector<string>* results);
 
@@ -281,6 +261,14 @@ class Env {
   virtual Status GetSymbolFromLibrary(void* handle, const char* symbol_name,
                                       void** symbol) = 0;
 
+  // \brief build the name of dynamic library.
+  //
+  // "name" should be name of the library.
+  // "version" should be the version of the library or NULL
+  // returns the name that LoadLibrary() can use
+  virtual string FormatLibraryFileName(const string& name,
+      const string& version) = 0;
+
  private:
   std::unique_ptr<FileSystemRegistry> file_system_registry_;
   TF_DISALLOW_COPY_AND_ASSIGN(Env);
@@ -338,11 +326,15 @@ class EnvWrapper : public Env {
                               void** symbol) override {
     return target_->GetSymbolFromLibrary(handle, symbol_name, symbol);
   }
-
+  string FormatLibraryFileName(const string& name,
+                               const string& version) override {
+    return target_->FormatLibraryFileName(name, version);
+  }
  private:
   Env* target_;
 };
 
+/// Represents a thread used to run a Tensorflow function.
 class Thread {
  public:
   Thread() {}
@@ -373,10 +365,21 @@ Status ReadFileToString(Env* env, const string& fname, string* data);
 Status WriteStringToFile(Env* env, const string& fname,
                          const StringPiece& data);
 
+/// Write binary representation of "proto" to the named file.
+Status WriteBinaryProto(Env* env, const string& fname,
+                        const ::tensorflow::protobuf::MessageLite& proto);
+
 /// Reads contents of named file and parse as binary encoded proto data
 /// and store into `*proto`.
 Status ReadBinaryProto(Env* env, const string& fname,
                        ::tensorflow::protobuf::MessageLite* proto);
+
+/// Read contents of named file and parse as text encoded proto data
+/// and store into `*proto`.
+Status ReadTextProto(Env* env, const string& fname,
+                     ::tensorflow::protobuf::Message* proto);
+
+// START_SKIP_DOXYGEN
 
 namespace register_file_system {
 
@@ -389,6 +392,8 @@ struct Register {
 };
 
 }  // namespace register_file_system
+
+// END_SKIP_DOXYGEN
 
 }  // namespace tensorflow
 

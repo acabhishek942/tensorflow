@@ -28,7 +28,24 @@ REGISTER_OP("Variable")
     .Attr("container: string = ''")
     .Attr("shared_name: string = ''")
     .SetIsStateful()
-    .SetShapeFn(shape_inference::UnknownShape)
+    .SetShapeFn([](InferenceContext* c) {
+      PartialTensorShape shape;
+      TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape));
+
+      // Variable has legacy behavior where we cannot tell the difference
+      // between a scalar shape attribute and 'unknown shape'.  So if the shape
+      // is a scalar, we return an unknown shape.
+      if (shape.dims() <= 0) {
+        return shape_inference::UnknownShape(c);
+      }
+
+      TensorShapeProto shape_proto;
+      shape.AsProto(&shape_proto);
+      ShapeHandle out;
+      TF_RETURN_IF_ERROR(c->MakeShapeFromShapeProto(shape_proto, &out));
+      c->set_output(0, out);
+      return Status::OK();
+    })
     .Doc(R"doc(
 Holds state in the form of a tensor that persists across steps.
 
@@ -441,9 +458,6 @@ REGISTER_OP("CountUpTo")
     })
     .Doc(R"doc(
 Increments 'ref' until it reaches 'limit'.
-
-This operation outputs "ref" after the update is done.  This makes it
-easier to chain operations that need to use the updated value.
 
 ref: Should be from a scalar `Variable` node.
 limit: If incrementing ref would bring it above limit, instead generates an

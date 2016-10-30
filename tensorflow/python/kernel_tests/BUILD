@@ -81,6 +81,13 @@ tf_py_test(
 )
 
 tf_py_test(
+    name = "conditional_accumulator_test",
+    size = "small",
+    srcs = ["conditional_accumulator_test.py"],
+    additional_deps = ["//tensorflow:tensorflow_py"],
+)
+
+tf_py_test(
     name = "ctc_decoder_ops_test",
     size = "small",
     srcs = ["ctc_decoder_ops_test.py"],
@@ -206,7 +213,7 @@ tf_py_test(
     additional_deps = ["//tensorflow:tensorflow_py"],
 )
 
-tf_py_test(
+cuda_py_test(
     name = "matrix_triangular_solve_op_test",
     size = "small",
     srcs = ["matrix_triangular_solve_op_test.py"],
@@ -273,6 +280,13 @@ tf_py_test(
     name = "sparse_concat_op_test",
     size = "small",
     srcs = ["sparse_concat_op_test.py"],
+    additional_deps = ["//tensorflow:tensorflow_py"],
+)
+
+tf_py_test(
+    name = "sparse_conditional_accumulator_test",
+    size = "small",
+    srcs = ["sparse_conditional_accumulator_test.py"],
     additional_deps = ["//tensorflow:tensorflow_py"],
 )
 
@@ -907,10 +921,19 @@ cuda_py_test(
     ],
 )
 
-cuda_py_test(
+tf_py_test(
     name = "sparse_serialization_ops_test",
     size = "small",
     srcs = ["sparse_serialization_ops_test.py"],
+    additional_deps = [
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+tf_py_test(
+    name = "sparse_tensors_map_ops_test",
+    size = "small",
+    srcs = ["sparse_tensors_map_ops_test.py"],
     additional_deps = [
         "//tensorflow:tensorflow_py",
     ],
@@ -1055,6 +1078,24 @@ cuda_py_test(
     name = "atrous_conv2d_test",
     size = "medium",
     srcs = ["atrous_conv2d_test.py"],
+    additional_deps = [
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+cuda_py_test(
+    name = "atrous_convolution_test",
+    size = "medium",
+    srcs = ["atrous_convolution_test.py"],
+    additional_deps = [
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+cuda_py_test(
+    name = "pool_test",
+    size = "medium",
+    srcs = ["pool_test.py"],
     additional_deps = [
         "//tensorflow:tensorflow_py",
     ],
@@ -1223,7 +1264,19 @@ cuda_py_test(
     additional_deps = [
         "//tensorflow:tensorflow_py",
     ],
-    tags = ["notsan"],  # http://b/30445083
+)
+
+cuda_py_test(
+    name = "large_concat_op_test",
+    size = "small",
+    srcs = ["large_concat_op_test.py"],
+    additional_deps = [
+        "//tensorflow:tensorflow_py",
+    ],
+    tags = [
+        "nomsan",
+        "notsan",
+    ],
 )
 
 cuda_py_test(
@@ -1281,6 +1334,7 @@ cuda_py_test(
     srcs = ["svd_op_test.py"],
     additional_deps = ["//tensorflow:tensorflow_py"],
     shard_count = 20,
+    tags = ["nomsan"],  # fails in msan from numpy calls
 )
 
 filegroup(
